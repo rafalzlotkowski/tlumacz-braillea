@@ -1,20 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Dekoder polskiego Braille'a ze zdjęcia (wersja z dopasowaniem siatki).
-
-Etapy:
-  1. ROI (podgląd pomniejszony, wycinek z oryginału)
-  2. normalizacja oświetlenia + progowanie -> kropki (współrzędne float)
-  3. prostowanie przez profil rzutowania (bez DBSCAN i bez rozciągania pionu)
-  4. siatka: linie -> rzędy (0..2) -> komórki i kolumny (0..1) w układzie bezwzględnym
-  5. dekodowanie automatem stanów (wielka litera, cyfry)
-
-Uruchomienie:
-  python braille_decoder.py zdjecie.jpg
-  python braille_decoder.py zdjecie.jpg --roi 100 200 800 400 --save wynik.png
-  python braille_decoder.py --selftest
-"""
+"""Dekoder polskiego Braille'a ze zdjęcia."""
 import argparse
 import sys
 from dataclasses import dataclass, field
@@ -23,25 +9,19 @@ import cv2
 import numpy as np
 from scipy.spatial import KDTree
 
-# --------------------------------------------------------------------------
-# KONFIGURACJA
-# --------------------------------------------------------------------------
-PREVIEW_WIDTH = 800          # szerokość podglądu przy wyborze ROI
-MAX_WORK_SIDE = 2400         # większy wycinek jest zmniejszany (szybkość)
-MAX_SKEW_DEG = 25            # maksymalny wykrywany kąt pochylenia
-CELL_PITCH_RANGE = (2.2, 3.8)  # rozstaw komórek / rozstaw kropek (standard ~2.4, druk/ekran bywa ~3.3)
-WORD_GAP_FACTOR = 4.0        # przerwa w poziomie > 4*d => granica wyrazu (spacja)
-LINE_GAP_FACTOR = 1.5        # przerwa > 1.5*d między kropkami => nowa linia tekstu
-ROW_GAP_FACTOR = 0.5         # przerwa > 0.5*d => nowy rząd kropek
+PREVIEW_WIDTH = 800
+MAX_WORK_SIDE = 2400
+MAX_SKEW_DEG = 25
+CELL_PITCH_RANGE = (2.2, 3.8)
+WORD_GAP_FACTOR = 4.0
+LINE_GAP_FACTOR = 1.5
+ROW_GAP_FACTOR = 0.5
+BG_DOWNSCALE = 0.25
 UNKNOWN_CHAR = "*"
-SPLIT_BLOBS = True         # rozdzielaj zlane plamy (wyłącz: --no-split)
-DEPTH_FRAC = 0.5           # próg = tło - DEPTH_FRAC*(tło-rdzeń kropki), --depth
+SPLIT_BLOBS = True
+DEPTH_FRAC = 0.5
 
-# --------------------------------------------------------------------------
-# TABELE (zapis numerami punktów 1-6, jak w tabelach: 1 4 / 2 5 / 3 6)
-# !!! Sprawdź z oficjalną polską tabelą Braille'a (PZN) - szczególnie znaki
-# diakrytyczne i interpunkcję.
-# --------------------------------------------------------------------------
+
 def cell(dots: str) -> tuple:
     """cell('145') -> (1,0,0,1,1,0). Kolejność: punkty 1..6."""
     return tuple(1 if str(i) in dots else 0 for i in range(1, 7))
@@ -53,7 +33,6 @@ _LETTERS = {
     "m": "134", "n": "1345", "o": "135", "p": "1234", "q": "12345",
     "r": "1235", "s": "234", "t": "2345", "u": "136", "v": "1236",
     "w": "2456", "x": "1346", "y": "13456", "z": "1356",
-    # polskie znaki
     "ą": "16", "ć": "146", "ę": "156", "ł": "126", "ń": "1456",
     "ó": "346", "ś": "246", "ź": "2346", "ż": "12346",
 }
@@ -75,58 +54,43 @@ BRAILLE_DIGITS = {"a": "1", "b": "2", "c": "3", "d": "4", "e": "5",
                   "f": "6", "g": "7", "h": "8", "i": "9", "j": "0"}
 DIGIT_TO_LETTER = {v: k for k, v in BRAILLE_DIGITS.items()}
 
-# cv2.putText nie rysuje polskich liter - do podpisów na obrazie
 _FOLD = str.maketrans("ąćęłńóśźżĄĆĘŁŃÓŚŹŻ", "acelnoszzACELNOSZZ")
 
 
-# --------------------------------------------------------------------------
-# OBRAZ, ROI
-# --------------------------------------------------------------------------
 def select_roi(img):
     """Wybór ROI na podglądzie, ale wycinek z ORYGINAŁU (pełna rozdzielczość)."""
     scale = PREVIEW_WIDTH / img.shape[1]
     preview = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
     title = "Zaznacz tekst Braille'a i nacisnij ENTER"
     x, y, w, h = [int(v) for v in cv2.selectROI(
-        title, preview, showCrosshair=True, fromCenter=False)]   # od rogu do rogu
+        title, preview, showCrosshair=True, fromCenter=False)]
     cv2.destroyWindow(title)
     if w == 0 or h == 0:
         return img
     return img[int(y / scale):int((y + h) / scale), int(x / scale):int((x + w) / scale)]
 
 
-def limit_size(img, max_side=MAX_WORK_SIDE):
-    s = max_side / max(img.shape[:2])
-    if s >= 1:
-        return img
-    return cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
-
-
-# --------------------------------------------------------------------------
-# DETEKCJA KROPEK
-# --------------------------------------------------------------------------
-def _odd(n, minimum):
-    n = max(int(n), minimum)
-    return n if n % 2 else n + 1
-
-
 def preprocess(image):
-    """Normalizacja oświetlenia (dzielenie przez tło) + próg względem szumu tła."""
+    """Normalizacja oświetlenia (tło liczone na zmniejszonym obrazie) + próg względem szumu tła."""
     h, w = image.shape[:2]
     base = np.sqrt(h * w)
-    blur_sz = _odd(base * 0.012, 3)
+    blur_sz = max(int(base * 0.012), 3)
+    blur_sz += 1 - blur_sz % 2
     morph_sz = max(2, int(base * 0.004))
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    background = cv2.GaussianBlur(gray, (0, 0), base * 0.08)
+    s = BG_DOWNSCALE if min(h, w) >= 200 else 1.0
+    small = cv2.resize(gray, None, fx=s, fy=s, interpolation=cv2.INTER_AREA) if s < 1 else gray
+    small = cv2.GaussianBlur(small, (0, 0), base * 0.08 * s)
+    background = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR) if s < 1 else small
     flat = cv2.divide(gray, background, scale=255)
     flat = cv2.GaussianBlur(flat, (blur_sz, blur_sz), 0)
 
-    med = float(np.median(flat))                      # tło dominuje => mediana = tło
+    med = float(np.median(flat))
     mad = float(np.median(np.abs(flat - med))) * 1.4826
-    noise_thr = med - max(8.0, 4.0 * mad)             # dolna granica: ponad szumem tła
-    core = float(np.percentile(flat, 2))              # ~rdzeń najciemniejszych kropek
-    half_thr = med - DEPTH_FRAC * (med - core)               # "pół głębokości": cienkie plamki
+    noise_thr = med - max(8.0, 4.0 * mad)
+    core = float(np.percentile(flat, 2))
+    half_thr = med - DEPTH_FRAC * (med - core)
     mask = (flat < min(noise_thr, half_thr)).astype(np.uint8) * 255
 
     kernel = np.ones((morph_sz, morph_sz), np.uint8)
@@ -167,7 +131,7 @@ def detect_dots(mask):
     for cnt, area, circ in info:
         if area < 0.35 * ref:
             continue
-        if not SPLIT_BLOBS:                         # każda plama = jedna kropka
+        if not SPLIT_BLOBS:
             if area <= 4 * ref and circ > 0.2:
                 m = cv2.moments(cnt)
                 if m["m00"] > 0:
@@ -183,7 +147,7 @@ def detect_dots(mask):
             k = int(round(area / ref))
             x, y, w, h = cv2.boundingRect(cnt)
             at_border = x <= 0 or y <= 0 or x + w >= mask.shape[1] or y + h >= mask.shape[0]
-            if 2 <= k <= 8 and not at_border:       # większe/graniczne plamy = śmieci
+            if 2 <= k <= 8 and not at_border:
                 dots += [[cx, cy, area / k] for cx, cy in _split_blob(cnt, k)]
     return np.array(dots) if dots else np.empty((0, 3))
 
@@ -198,12 +162,9 @@ def nn_distance(xy):
     return float(np.median(trimmed if len(trimmed) else nn))
 
 
-# --------------------------------------------------------------------------
-# PROSTOWANIE (profil rzutowania)
-# --------------------------------------------------------------------------
 def _row_score(xy, angle_deg, bin_w):
     a = np.radians(angle_deg)
-    y = -np.sin(a) * xy[:, 0] + np.cos(a) * xy[:, 1]   # zgodne z getRotationMatrix2D
+    y = -np.sin(a) * xy[:, 0] + np.cos(a) * xy[:, 1]
     bins = np.floor((y - y.min()) / bin_w).astype(int)
     return float(np.sum(np.bincount(bins).astype(float) ** 2))
 
@@ -211,14 +172,16 @@ def _row_score(xy, angle_deg, bin_w):
 def estimate_skew(xy, d, max_deg=MAX_SKEW_DEG):
     """Kąt (stopnie) dla cv2.getRotationMatrix2D, który prostuje rzędy kropek."""
     bin_w = d / 3.0
-    coarse = np.arange(-max_deg, max_deg + 1e-9, 0.5)
+    coarse = np.arange(-max_deg, max_deg + 1e-9, 1.0)
     best = coarse[int(np.argmax([_row_score(xy, a, bin_w) for a in coarse]))]
-    fine = np.arange(best - 0.5, best + 0.5 + 1e-9, 0.05)
-    return float(fine[int(np.argmax([_row_score(xy, a, bin_w) for a in fine]))])
+    fine = np.arange(best - 1.0, best + 1.0 + 1e-9, 0.1)
+    best = fine[int(np.argmax([_row_score(xy, a, bin_w) for a in fine]))]
+    finer = np.arange(best - 0.1, best + 0.1 + 1e-9, 0.02)
+    return float(finer[int(np.argmax([_row_score(xy, a, bin_w) for a in finer]))])
 
 
-def rotate_keep_all(image, xy, angle):
-    """Obrót z powiększeniem płótna (nic nie wypada) + transformacja punktów (float)."""
+def rotate_keep_all(image, xy, angle, warp=True):
+    """Obrót z powiększeniem płótna + transformacja punktów; warp=False pomija obrót obrazu."""
     h, w = image.shape[:2]
     c = (w / 2.0, h / 2.0)
     M = cv2.getRotationMatrix2D(c, angle, 1.0)
@@ -226,15 +189,12 @@ def rotate_keep_all(image, xy, angle):
     nw, nh = int(h * sin + w * cos), int(h * cos + w * sin)
     M[0, 2] += nw / 2.0 - c[0]
     M[1, 2] += nh / 2.0 - c[1]
-    rotated = cv2.warpAffine(image, M, (nw, nh), flags=cv2.INTER_CUBIC,
-                             borderMode=cv2.BORDER_REPLICATE)
+    rotated = (cv2.warpAffine(image, M, (nw, nh), flags=cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_REPLICATE) if warp else None)
     pts = cv2.transform(xy.reshape(-1, 1, 2).astype(np.float64), M).reshape(-1, 2)
     return rotated, pts
 
 
-# --------------------------------------------------------------------------
-# SIATKA
-# --------------------------------------------------------------------------
 def split_by_gap(values, eps):
     """Grupy indeksów posortowanych wartości; cięcie tam, gdzie luka > eps."""
     values = np.asarray(values, float)
@@ -246,12 +206,7 @@ def split_by_gap(values, eps):
 
 
 def resolve_line_tops(centers_per_line, d_y):
-    """
-    Dla każdej linii tekstu wyznacza y górnego rzędu (punkty 1 i 4).
-    Linie z 3 rzędami są jednoznaczne. Dla niepełnych (np. tylko rzędy 1 i 3
-    albo tylko jeden rząd) wybieramy wariant najlepiej pasujący do rastra linii
-    wyznaczonego z linii pełnych.
-    """
+    """Dla każdej linii tekstu wyznacza y górnego rzędu (punkty 1 i 4)."""
     full = [i for i, c in enumerate(centers_per_line)
             if len(c) == 3 and np.all(np.abs(np.diff(c) - d_y) < 0.25 * d_y)]
     full_tops = [centers_per_line[i][0] for i in full]
@@ -267,7 +222,7 @@ def resolve_line_tops(centers_per_line, d_y):
             tops.append(c0)
             continue
         best = None
-        for shift in range(3):                       # c0 leży w rzędzie 'shift'
+        for shift in range(3):
             t = c0 - shift * d_y
             if any(round((ci - t) / d_y) > 2 for ci in c):
                 continue
@@ -303,13 +258,7 @@ def _fit_from_anchor(xs, x0, P, dx, cap):
 
 
 def fit_word(xs, P, dx):
-    """
-    Siatka jednego wyrazu. Pierwsza kropka wyrazu jest albo lewą kolumną pierwszej
-    komórki (x0 = min x), albo prawą (x0 = min x - dx, np. znak wielkiej litery,
-    czyli sam punkt 6). Wybieramy lepsze dopasowanie; przy remisie (np. wyraz
-    z jedną kolumną) zakładamy lewą kolumnę.
-    Zwraca (x0, k, c); k liczone od 0.
-    """
+    """Siatka jednego wyrazu. Zwraca (x0, k, c); k liczone od 0."""
     cap = 0.35 * dx
     left = _fit_from_anchor(xs, float(xs.min()), P, dx, cap)
     right = _fit_from_anchor(xs, float(xs.min()) - dx, P, dx, cap)
@@ -319,32 +268,28 @@ def fit_word(xs, P, dx):
     return x0 + kmin * P, k - kmin, c
 
 
+def _pitch_cost(multi, P, dx, cap):
+    return sum(min(_fit_from_anchor(xs, float(xs.min()), P, dx, cap)[0],
+                   _fit_from_anchor(xs, float(xs.min()) - dx, P, dx, cap)[0])
+               for xs in multi)
+
+
 def fit_cell_pitch(words_xs, d, dx):
-    """Rozstaw komórek P wspólny dla całego ROI (faza osobno dla każdego wyrazu)."""
+    """Rozstaw komórek P wspólny dla całego ROI (przeszukiwanie zgrubne, potem dokładne)."""
     cap = 0.35 * dx
-    multi = [xs for xs in words_xs if np.ptp(xs) > 0.5 * dx]   # wyrazy bez informacji pomijamy
+    multi = [xs for xs in words_xs if np.ptp(xs) > 0.5 * dx]
     if not multi:
         return 2.4 * d
-    best_cost, best_P = np.inf, 2.4 * d
-    for P in np.linspace(CELL_PITCH_RANGE[0] * d, CELL_PITCH_RANGE[1] * d, 73):
-        cost = 0.0
-        for xs in multi:
-            cost += min(_fit_from_anchor(xs, float(xs.min()), P, dx, cap)[0],
-                        _fit_from_anchor(xs, float(xs.min()) - dx, P, dx, cap)[0])
-        if cost < best_cost:
-            best_cost, best_P = cost, float(P)
-    return best_P
+    lo, hi = CELL_PITCH_RANGE[0] * d, CELL_PITCH_RANGE[1] * d
+    coarse = np.linspace(lo, hi, 17)
+    best = float(coarse[int(np.argmin([_pitch_cost(multi, P, dx, cap) for P in coarse]))])
+    step = coarse[1] - coarse[0]
+    fine = np.linspace(max(lo, best - step), min(hi, best + step), 17)
+    return float(fine[int(np.argmin([_pitch_cost(multi, P, dx, cap) for P in fine]))])
 
 
-# --------------------------------------------------------------------------
-# DEKODOWANIE
-# --------------------------------------------------------------------------
 def decode_cells(patterns):
-    """
-    Automat stanów. Zwraca listę tekstów (po jednym na komórkę; '' dla znaków
-    sterujących). Wielka litera: ^ + litera, ^^ + wyraz (do spacji).
-    Cyfry: # + a..j, do spacji (przecinek i kropka nie przerywają liczby).
-    """
+    """Automat stanów. Zwraca listę tekstów (po jednym na komórkę; '' dla znaków sterujących)."""
     out = []
     upper_next = upper_word = number = False
     for pat in patterns:
@@ -378,24 +323,21 @@ def decode_cells(patterns):
 @dataclass
 class Cell:
     pattern: tuple
-    bbox: tuple                    # (x1, y1, x2, y2) w układzie obrazu po obrocie
+    bbox: tuple
     char: str = ""
 
 
 @dataclass
 class Result:
     text: str = ""
-    lines: list = field(default_factory=list)      # list[list[Cell]]
+    lines: list = field(default_factory=list)
     d: float = 0.0
     cell_pitch_ratio: float = 0.0
     angle: float = 0.0
 
 
-def decode_lattice(xy):
+def decode_lattice(xy, d0):
     """Dopasowanie siatki do (już wyprostowanych) kropek i dekodowanie."""
-    d0 = nn_distance(xy)
-
-    # 1. linie tekstu (po y) i rzędy w liniach
     groups = split_by_gap(xy[:, 1], LINE_GAP_FACTOR * d0)
     centers = []
     for g in groups:
@@ -407,19 +349,17 @@ def decode_lattice(xy):
     gaps = np.concatenate(gaps) if gaps else np.array([])
     gaps = gaps[(gaps > 0.6 * d0) & (gaps < 1.6 * d0)]
     d_y = float(np.median(gaps)) if len(gaps) else d0
-    dx = d_y                                         # założenie: rozstaw poziomy = pionowy
+    dx = d_y
 
     tops = resolve_line_tops(centers, d_y)
 
-    # 2. wyrazy (przerwy w poziomie) i rozstaw komórek P
-    words_per_line = []
-    for g in groups:
-        xs_line = xy[g, 0]
-        words_per_line.append([g[w] for w in split_by_gap(xs_line, WORD_GAP_FACTOR * d_y)])
-    all_words_xs = [xy[w, 0] for words in words_per_line for w in words]
-    P = fit_cell_pitch(all_words_xs, d_y, dx)
+    rough = [[xy[g[w], 0] for w in split_by_gap(xy[g, 0], WORD_GAP_FACTOR * d_y)]
+             for g in groups]
+    P = fit_cell_pitch([xs for words in rough for xs in words], d_y, dx)
 
-    # 3. przypisanie kropek do (linia, wyraz, komórka, rząd, kolumna)
+    word_gap = 1.5 * P - 0.5 * dx
+    words_per_line = [[g[w] for w in split_by_gap(xy[g, 0], word_gap)] for g in groups]
+
     result = Result(d=d_y, cell_pitch_ratio=P / d_y)
     pad = 0.5 * d_y
     for words, top in zip(words_per_line, tops):
@@ -431,7 +371,7 @@ def decode_lattice(xy):
             grids = {}
             for ki, ci, ri in zip(k, c, r):
                 grids.setdefault(int(ki), [0] * 6)[int(ri + 3 * ci)] = 1
-            if wi > 0:                                # granica wyrazu = jedna spacja
+            if wi > 0:
                 cells.append(Cell(cell(""), (0, 0, 0, 0)))
             for i in range(int(k.max()) + 1):
                 xl = x0 + i * P
@@ -445,26 +385,28 @@ def decode_lattice(xy):
     return result
 
 
-# --------------------------------------------------------------------------
-# PIPELINE I WIZUALIZACJA
-# --------------------------------------------------------------------------
 def process(crop):
-    """Obraz (BGR) -> (Result, obraz po obrocie, punkty po obrocie)."""
-    crop = limit_size(crop)
-    dots = detect_dots(preprocess(crop))
+    """Obraz (BGR) -> (Result, obraz roboczy, punkty po obrocie)."""
+    work = crop
+    s = MAX_WORK_SIDE / max(crop.shape[:2])
+    if s < 1:
+        work = cv2.resize(crop, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    dots = detect_dots(preprocess(work))
     if len(dots) < 6:
         raise ValueError(f"Wykryto za mało kropek ({len(dots)}).")
     xy = dots[:, :2]
-    angle = estimate_skew(xy, nn_distance(xy))
-    rotated, xy_rot = rotate_keep_all(crop, xy, angle)
-    result = decode_lattice(xy_rot)
+    d0 = nn_distance(xy)
+    angle = estimate_skew(xy, d0)
+    xy_rot = rotate_keep_all(work, xy, angle, warp=False)[1]
+    result = decode_lattice(xy_rot, d0)
     result.angle = angle
-    return result, rotated, xy_rot
+    return result, work, xy_rot
 
 
-def visualize(image, xy, result):
-    out = image.copy()
-    for x, y in xy:
+def visualize(work, xy_rot, result):
+    """Rysuje kropki i ramki komórek na wyprostowanym obrazie."""
+    out = rotate_keep_all(work, xy_rot, result.angle)[0]
+    for x, y in xy_rot:
         cv2.circle(out, (int(round(x)), int(round(y))), 3, (0, 255, 0), -1)
     for line in result.lines:
         for c in line:
@@ -478,9 +420,6 @@ def visualize(image, xy, result):
     return out
 
 
-# --------------------------------------------------------------------------
-# TEST SYNTETYCZNY
-# --------------------------------------------------------------------------
 def encode_text(text):
     cells, num = [], False
     for ch in text:
@@ -530,17 +469,17 @@ def render_synthetic(text, d=14, angle=0.0, jitter=0.5, seed=0,
                     cv2.circle(img, (int(round(x)), int(round(y))), int(d * 0.25),
                                70, -1, cv2.LINE_AA)
     img = cv2.GaussianBlur(img, (5, 5), 0).astype(np.float32)
-    img *= np.linspace(0.65, 1.0, W, dtype=np.float32)[None, :]      # nierówne światło
+    img *= np.linspace(0.65, 1.0, W, dtype=np.float32)[None, :]
     img += rng.normal(0, 3, img.shape).astype(np.float32)
     img = cv2.cvtColor(np.clip(img, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
     if angle:
-        img, _ = rotate_keep_all(img, np.zeros((1, 2)), angle)
+        img = rotate_keep_all(img, np.zeros((1, 2)), angle)[0]
     return img
 
 
 def selftest():
     text = "Ala ma kota.\nŻółć 123, gęś!\nz ń ą\nb"
-    text2 = "ala ma kota a kot ma\nal"                  # geometria jak na zdjęciu użytkownika
+    text2 = "ala ma kota a kot ma\nal"
     cases = []
     for angle in (0, 4, -9, 17):
         for seed in (0, 1):
@@ -555,7 +494,7 @@ def selftest():
         img = render_synthetic(expected, **kw)
         try:
             got = process(img)[0].text
-        except Exception as e:                          # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             got = f"<błąd: {e}>"
         good = got == expected
         ok &= good
@@ -604,7 +543,7 @@ def main():
         crop = select_roi(img)
 
     try:
-        result, rotated, xy = process(crop)
+        result, work, xy = process(crop)
     except ValueError as e:
         sys.exit(str(e))
 
@@ -615,15 +554,14 @@ def main():
     print(f"\nZdekodowany tekst:\n{result.text}\n")
 
     if args.debug:
-        n = len(xy)
-        print(f"Wykryte kropki: {n}  (kąt {result.angle:.2f}°)")
+        print(f"Wykryte kropki: {len(xy)}  (kąt {result.angle:.2f}°)")
         for i, line in enumerate(result.lines):
             print(f"linia {i}: " + " ".join(dots_of(c.pattern) for c in line))
         base = (args.save or "debug.png").rsplit(".", 1)[0]
-        cv2.imwrite(base + "_mask.png", preprocess(limit_size(crop)))
+        cv2.imwrite(base + "_mask.png", preprocess(work))
         print(f"Zapisano maskę: {base}_mask.png")
 
-    vis = visualize(rotated, xy, result)
+    vis = visualize(work, xy, result)
     if args.save:
         cv2.imwrite(args.save, vis)
         print(f"Zapisano: {args.save}")
