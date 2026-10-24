@@ -10,7 +10,7 @@ _FOLD = str.maketrans("ąćęłńóśźżĄĆĘŁŃÓŚŹŻ", "acelnoszzACELNOSZ
 
 
 def select_roi(img, cfg: Config = None):
-    """Wybór ROI na podglądzie, ale wycinek z ORYGINAŁU (pełna rozdzielczość)."""
+    """Wybór ROI na podglądzie, ale wycinek z ORYGINAŁU ."""
     cfg = cfg or Config()
     scale = cfg.preview_width / img.shape[1]
     preview = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
