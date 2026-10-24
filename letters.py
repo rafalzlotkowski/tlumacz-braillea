@@ -19,7 +19,7 @@ _LETTERS = {
     "ó": "346", "ś": "246", "ź": "2346", "ż": "12346",
 }
 _PUNCT = {
-    ",": "2", ";": "23", ":": "25", ".": "256", "?": "26", "!": "235",
+    ",": "2", ";": "23", ":": "25", ".": "3", "?": "26", "!": "235",
     "-": "36",
 }
 
@@ -28,7 +28,7 @@ CHAR_TO_CELL[" "] = cell("")
 BRAILLE_DICT = {pat: ch for ch, pat in CHAR_TO_CELL.items()}
 assert len(BRAILLE_DICT) == len(CHAR_TO_CELL), "Powtórzony wzorzec w tabeli!"
 
-CAPITAL_SIGN = cell("6")
+CAPITAL_SIGN = cell("46")
 NUMBER_SIGN = cell("3456")
 SIGN_LABELS = {CAPITAL_SIGN: "^", NUMBER_SIGN: "#"}
 
