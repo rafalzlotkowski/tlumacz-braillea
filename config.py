@@ -5,7 +5,7 @@ from dataclasses import dataclass
 @dataclass
 class Config:
     preview_width: int = 800
-    max_work_side: int = 2400
+    max_work_side: int = 3400
     max_skew_deg: float = 25
     cell_pitch_range: tuple = (2.2, 3.8)
     word_gap_factor: float = 4.0

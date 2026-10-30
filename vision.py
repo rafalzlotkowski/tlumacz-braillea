@@ -1,4 +1,3 @@
-"""Przetwarzanie obrazu: wykrywanie kropek, rozstaw, kąt pochylenia, obrót."""
 import cv2
 import numpy as np
 from scipy.spatial import KDTree
@@ -7,19 +6,26 @@ from config import Config
 
 
 def preprocess(image, cfg: Config):
-    """Normalizacja oświetlenia (tło liczone na zmniejszonym obrazie) + próg względem szumu tła."""
+    """Normalizacja oświetlenia """
     h, w = image.shape[:2]
-    base = np.sqrt(h * w)
+    
+    pad_px = max(10, int(np.sqrt(h * w) * 0.02))
+    padded_image = cv2.copyMakeBorder(image, pad_px, pad_px, pad_px, pad_px, cv2.BORDER_REFLECT_101)
+    ph, pw = padded_image.shape[:2]
+    
+    base = np.sqrt(ph * pw)
     blur_sz = max(int(base * 0.012), 3)
     blur_sz += 1 - blur_sz % 2
     morph_sz = max(2, int(base * 0.004))
 
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    s = cfg.bg_downscale if min(h, w) >= 200 else 1.0
+    gray = cv2.cvtColor(padded_image, cv2.COLOR_BGR2GRAY)
+    s = cfg.bg_downscale if min(ph, pw) >= 200 else 1.0
     small = cv2.resize(gray, None, fx=s, fy=s, interpolation=cv2.INTER_AREA) if s < 1 else gray
     small = cv2.GaussianBlur(small, (0, 0), base * 0.08 * s)
-    background = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR) if s < 1 else small
-    flat = cv2.divide(gray, background, scale=255)
+    background = cv2.resize(small, (pw, ph), interpolation=cv2.INTER_LINEAR) if s < 1 else small
+    
+    background = np.clip(background.astype(np.float32), 1.0, 255.0)
+    flat = cv2.divide(gray.astype(np.float32), background, scale=255.0)
     flat = cv2.GaussianBlur(flat, (blur_sz, blur_sz), 0)
 
     med = float(np.median(flat))
@@ -27,10 +33,14 @@ def preprocess(image, cfg: Config):
     noise_thr = med - max(8.0, 4.0 * mad)
     core = float(np.percentile(flat, 2))
     half_thr = med - cfg.depth_frac * (med - core)
+    
     mask = (flat < min(noise_thr, half_thr)).astype(np.uint8) * 255
 
     kernel = np.ones((morph_sz, morph_sz), np.uint8)
-    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    
+    mask_unpadded = mask[pad_px:ph-pad_px, pad_px:pw-pad_px]
+    return mask_unpadded
 
 
 def _split_blob(cnt, k):
@@ -56,7 +66,7 @@ def detect_dots(mask, cfg: Config):
         perim = cv2.arcLength(cnt, True)
         if area < 4 or perim == 0:
             continue
-        info.append((cnt, area, 4 * np.pi * area / perim ** 2))
+        info.append((cnt, area, 4 * np.pi * area / (perim ** 2)))
     if not info:
         return np.empty((0, 3))
 
@@ -82,8 +92,7 @@ def detect_dots(mask, cfg: Config):
         else:
             k = int(round(area / ref))
             x, y, w, h = cv2.boundingRect(cnt)
-            at_border = x <= 0 or y <= 0 or x + w >= mask.shape[1] or y + h >= mask.shape[0]
-            if 2 <= k <= 8 and not at_border:
+            if 2 <= k <= 8 and area <= 15 * ref:
                 dots += [[cx, cy, area / k] for cx, cy in _split_blob(cnt, k)]
     return np.array(dots) if dots else np.empty((0, 3))
 
@@ -126,6 +135,6 @@ def rotate_keep_all(image, xy, angle, warp=True):
     M[0, 2] += nw / 2.0 - c[0]
     M[1, 2] += nh / 2.0 - c[1]
     rotated = (cv2.warpAffine(image, M, (nw, nh), flags=cv2.INTER_LINEAR,
-                              borderMode=cv2.BORDER_REPLICATE) if warp else None)
+                             borderMode=cv2.BORDER_REPLICATE) if warp else None)
     pts = cv2.transform(xy.reshape(-1, 1, 2).astype(np.float64), M).reshape(-1, 2)
     return rotated, pts
